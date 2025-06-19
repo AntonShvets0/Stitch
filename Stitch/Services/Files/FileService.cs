@@ -2,15 +2,16 @@
 using System.Text;
 using Stitch.Models;
 
-namespace Stitch.Services;
+namespace Stitch.Services.Files;
 
 public class FileService(GitIgnoreChecker gitIgnoreChecker, AliasPathReplacer aliasPathReplacer)
 {
     public List<string> GetFilesByPattern(IEnumerable<string> patterns, bool skipGitignore)
     {
         var files = new List<string>();
-        foreach (var pattern in patterns)
+        foreach (var rawPattern in patterns)
         {
+            var pattern = aliasPathReplacer.ReplaceAliases(rawPattern);
             var directory = Path.GetDirectoryName(pattern);
             if (string.IsNullOrEmpty(directory))
                 directory = ".";

@@ -1,6 +1,6 @@
 ﻿using System.Text.RegularExpressions;
 
-namespace Stitch.Services;
+namespace Stitch.Services.Files;
 
 public class GitIgnoreChecker
 {

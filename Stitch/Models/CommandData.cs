@@ -1,6 +1,3 @@
 ﻿namespace Stitch.Models;
 
-public class CommandData
-{
-    
-}
+public record CommandData(Predicate<CommandOptions> Pattern, Type CommandType);

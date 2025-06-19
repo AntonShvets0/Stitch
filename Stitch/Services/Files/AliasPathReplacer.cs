@@ -1,4 +1,4 @@
-﻿namespace Stitch.Services;
+﻿namespace Stitch.Services.Files;
 
 public class AliasPathReplacer
 {
@@ -6,10 +6,11 @@ public class AliasPathReplacer
 
     public AliasPathReplacer()
     {
-        if (File.Exists("aliases.txt"))
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "aliases.txt");
+        if (File.Exists(path))
         {
             _aliases = File
-                .ReadAllLines("aliases.txt")
+                .ReadAllLines(path)
                 .Where(a => a.Contains('='))
                 .Select(a => a.Split('='))
                 .ToDictionary(a => a[0].Trim(), a => a[1].Trim());
