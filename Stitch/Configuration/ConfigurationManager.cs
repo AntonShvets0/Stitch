@@ -43,7 +43,6 @@ public static class ConfigurationManager
             },
             AppSettings = new
             {
-                BundleDirectory = "bundles",
                 MaxFileSize = 50 * 1024 * 1024,
                 MaxTotalFiles = 1000,
                 DefaultExtensions = new[] { "md" }
