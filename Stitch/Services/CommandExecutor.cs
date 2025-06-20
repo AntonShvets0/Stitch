@@ -5,20 +5,14 @@ namespace Stitch.Services;
 
 public class CommandExecutor(CommandFactory commandFactory)
 {
-    public void Execute(CommandOptions? commandOptions)
+    public async Task ExecuteAsync(CommandOptions commandOptions)
     {
-        if (commandOptions == null)
-            commandOptions = new CommandOptions
-            {
-                ShowHelp = true
-            };
-        
-        ExecuteCommands(commandFactory.CreateCommands(commandOptions), commandOptions);
+        await ExecuteCommandsAsync(commandFactory.CreateCommands(commandOptions), commandOptions);
     }
 
-    private void ExecuteCommands(IEnumerable<ICommand> commands, CommandOptions options)
+    private async Task ExecuteCommandsAsync(IEnumerable<ICommand> commands, CommandOptions options)
     {
         foreach (var command in commands)
-            command.Execute(options);
+            await command.ExecuteAsync(options);
     }
 }

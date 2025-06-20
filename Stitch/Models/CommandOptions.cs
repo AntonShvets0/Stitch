@@ -9,7 +9,7 @@ public class CommandOptions
     
     [Option('h', "help", Required = false, HelpText = "Show help information")]
     public bool ShowHelp { get; set; }
-    
+
     [Option('l', "lines", Required = false, HelpText = "Show line count")]
     public bool ShowLinesCount { get; set; }
     
@@ -18,4 +18,10 @@ public class CommandOptions
     
     [Option("ignore-gitignore", Required = false, HelpText = "Gitignore Pattern")]
     public bool IgnoreGitignore { get; set; }
+        
+    [Option("exclude-defaults", Required = false, HelpText = "Exclude default extension from appsettings.json")]
+    public bool ExcludeDefaultExtensions { get; set; }
+
+    [Option("clean", Required = false, HelpText = "Compress code")]
+    public bool CleanCode { get; set; }
 }

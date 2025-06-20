@@ -4,5 +4,5 @@ namespace Stitch.Commands;
 
 public interface ICommand
 {
-    public void Execute(CommandOptions commandOptions);
+    public Task ExecuteAsync(CommandOptions commandOptions);
 }

@@ -1,145 +1,254 @@
-﻿using System.Diagnostics;
-using System.Text;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Stitch.CodeCleaners;
 using Stitch.Models;
 
 namespace Stitch.Services.Files;
 
-public class FileService(GitIgnoreChecker gitIgnoreChecker, AliasPathReplacer aliasPathReplacer)
+public class FileService
 {
-    public List<string> GetFilesByPattern(IEnumerable<string> patterns, bool skipGitignore)
+    private readonly ILogger<FileService> _logger;
+    private readonly GitIgnoreChecker _gitIgnoreChecker;
+    private readonly AliasPathReplacer _aliasPathReplacer;
+    private readonly IEnumerable<ICodeCleaner> _codeCleaners;
+    private readonly StitchConfiguration _config;
+    
+    public FileService(
+        ILogger<FileService> logger,
+        GitIgnoreChecker gitIgnoreChecker,
+        AliasPathReplacer aliasPathReplacer,
+        IEnumerable<ICodeCleaner> codeCleaners,
+        IOptions<StitchConfiguration> config)
     {
-        var files = new List<string>();
-        foreach (var rawPattern in patterns)
-        {
-            var pattern = aliasPathReplacer.ReplaceAliases(rawPattern);
-            var directory = Path.GetDirectoryName(pattern);
-            if (string.IsNullOrEmpty(directory))
-                directory = ".";
-
-            var gitignorePath = Path.Combine(directory, ".gitignore");
-            var gitignorePatterns = !skipGitignore && File.Exists(gitignorePath)
-                ? ParseGitignore(File.ReadAllLines(gitignorePath))
-                : new List<string>();
-
-            var searchPattern = Path.GetFileName(pattern);
-            if (string.IsNullOrEmpty(searchPattern))
-                searchPattern = "*.*";
-
-            var foundFiles = Directory.GetFiles(directory, searchPattern, SearchOption.AllDirectories)
-                .OrderBy(f => f)
-                .ToList();
-
-            // Фильтруем файлы по gitignore паттернам
-            if (!skipGitignore && gitignorePatterns.Any())
-            {
-                foundFiles = foundFiles
-                    .Where(file => !gitIgnoreChecker.IsIgnored(file, gitignorePatterns, directory))
-                    .ToList();
-            }
-
-            files.AddRange(foundFiles);
-        }
-
-        return files;
+        _logger = logger;
+        _gitIgnoreChecker = gitIgnoreChecker;
+        _aliasPathReplacer = aliasPathReplacer;
+        _codeCleaners = codeCleaners;
+        _config = config.Value;
     }
+    
+    public async Task<Result<List<string>>> GetFilesByPatternAsync(
+        IEnumerable<string> patterns, 
+        bool skipGitignore,
+        string[] additionalExtensions,
+        IProgress<ProgressInfo> progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var files = new List<string>();
+            var patternList = patterns.ToList();
 
+            foreach (var pattern in patterns)
+            {
+                foreach (var additionalExtension in additionalExtensions)
+                {
+                    var directory = 
+                        !string.IsNullOrEmpty(Path.GetExtension(pattern)) ?
+                        Path.GetDirectoryName(pattern) :
+                        pattern;
+                    if (string.IsNullOrEmpty(directory)) directory = ".";
+                    patternList.Add(Path.Combine(directory, $"*.{additionalExtension}"));
+                }   
+            }
+            
+            for (int i = 0; i < patternList.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                
+                var pattern = patternList[i];
+                progress?.Report(new ProgressInfo($"Processing pattern: {pattern}", i, patternList.Count));
+                
+                var result = await ProcessPatternAsync(pattern, skipGitignore, cancellationToken);
+                if (!result.IsSuccess)
+                {
+                    _logger.LogWarning("Failed to process pattern {Pattern}: {Error}", pattern, result.Error);
+                    continue;
+                }
+                
+                files.AddRange(result.Value);
+            }
+            
+            if (files.Count > _config.MaxTotalFiles)
+            {
+                return Result<List<string>>.Failure(
+                    $"Too many files found: {files.Count}. Maximum allowed: {_config.MaxTotalFiles}");
+            }
+            
+            progress?.Report(new ProgressInfo("Complete", patternList.Count, patternList.Count));
+            
+            return Result<List<string>>.Success(files.Distinct().OrderBy(f => f).ToList());
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("File search operation was cancelled");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting files by patterns");
+            return Result<List<string>>.Failure($"Unexpected error: {ex.Message}");
+        }
+    }
+    
+    private async Task<Result<List<string>>> ProcessPatternAsync(
+        string rawPattern, 
+        bool skipGitignore, 
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var pattern = _aliasPathReplacer.ReplaceAliases(rawPattern);
+            var directory = Path.GetDirectoryName(pattern);
+            if (string.IsNullOrEmpty(directory)) directory = ".";
+            
+            if (!Directory.Exists(directory))
+            {
+                return Result<List<string>>.Failure($"Directory not found: {directory}");
+            }
+            
+            var searchPattern = Path.GetFileName(pattern);
+            if (string.IsNullOrEmpty(searchPattern)) return Result<List<string>>.Success([]);
+            
+            var files = Directory.EnumerateFiles(directory, searchPattern, SearchOption.AllDirectories);
+            
+            var validFiles = new List<string>();
+            var gitignorePatterns = await GetGitignorePatternsAsync(directory, skipGitignore);
+            
+            foreach (var file in files)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                
+                if (IsValidFile(file, gitignorePatterns, directory, skipGitignore))
+                {
+                    validFiles.Add(file);
+                }
+            }
+            
+            return Result<List<string>>.Success(validFiles);
+        }
+        catch (Exception ex)
+        {
+            return Result<List<string>>.Failure($"Error processing pattern {rawPattern}: {ex.Message}");
+        }
+    }
+    
+    public async Task<Result<string>> CombineFilesAsync(
+        List<string> files, 
+        bool cleanCode,
+        IProgress<ProgressInfo> progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            const int maxConcurrency = 4;
+            using var semaphore = new SemaphoreSlim(maxConcurrency);
+    
+            var tasks = files.Select(async (file, index) =>
+            {
+                await semaphore.WaitAsync(cancellationToken);
+                try
+                {
+                    progress?.Report(new ProgressInfo($"Processing: {Path.GetFileName(file)}", index, files.Count));
+                    return await ProcessFileAsync(file, cleanCode, cancellationToken);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+
+            var results = await Task.WhenAll(tasks);
+            progress?.Report(new ProgressInfo("Complete", files.Count, files.Count));
+            return Result<string>.Success(string.Join("\n", results.Select(r => r.Value)));
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("File combination operation was cancelled");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error combining files");
+            return Result<string>.Failure($"Error combining files: {ex.Message}");
+        }
+    }
+    
+    private async Task<Result<string>> ProcessFileAsync(
+        string filePath, 
+        bool cleanCode, 
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Проверка размера файла
+            var fileInfo = new FileInfo(filePath);
+            if (fileInfo.Length > _config.MaxFileSize)
+            {
+                return Result<string>.Failure($"File {filePath} is too large: {fileInfo.Length} bytes");
+            }
+            
+            string content;
+            await using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var reader = new StreamReader(fileStream))
+            {
+                content = await reader.ReadToEndAsync().ConfigureAwait(false);
+            }
+            
+            if (cleanCode)
+            {
+                var extension = Path.GetExtension(filePath).TrimStart('.');
+                var cleaner = _codeCleaners.FirstOrDefault(c => c.Extension.Equals(extension, StringComparison.OrdinalIgnoreCase));
+                if (cleaner != null)
+                {
+                    content = cleaner.Clean(content);
+                }
+            }
+            
+            return Result<string>.Success(content);
+        }
+        catch (Exception ex)
+        {
+            return Result<string>.Failure($"Error reading file {filePath}: {ex.Message}");
+        }
+    }
+    
+    private async Task<List<string>> GetGitignorePatternsAsync(string directory, bool skipGitignore)
+    {
+        if (skipGitignore) return new List<string>();
+        
+        var gitignorePath = Path.Combine(directory, ".gitignore");
+        if (!File.Exists(gitignorePath)) return new List<string>();
+        
+        try
+        {
+            var lines = await File.ReadAllLinesAsync(gitignorePath);
+            return ParseGitignore(lines);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error reading .gitignore file at {Path}", gitignorePath);
+            return new List<string>();
+        }
+    }
+    
     private List<string> ParseGitignore(string[] lines)
     {
-        var patterns = new List<string>();
-
-        foreach (var line in lines)
-        {
-            var trimmed = line.Trim();
-
-            // Пропускаем пустые строки и комментарии
-            if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith("#"))
-                continue;
-
-            // Пропускаем негативные паттерны (начинающиеся с !)
-            if (trimmed.StartsWith("!"))
-                continue;
-
-            patterns.Add(trimmed);
-        }
-
-        return patterns;
+        return lines
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrEmpty(line) && !line.StartsWith("#") && !line.StartsWith("!"))
+            .ToList();
     }
-
-    public string CombineFiles(List<string> files)
+    
+    private bool IsValidFile(string file, List<string> gitignorePatterns, string directory, bool skipGitignore)
     {
-        var combined = new StringBuilder();
-
-        foreach (var file in files)
+        // Проверка на .gitignore
+        if (!skipGitignore && gitignorePatterns.Any())
         {
-            combined.AppendLine($"// ===== {Path.GetFileName(file)} =====");
-            combined.AppendLine(File.ReadAllText(file));
-            combined.AppendLine();
+            if (_gitIgnoreChecker.IsIgnored(file, gitignorePatterns, directory))
+                return false;
         }
-
-        return combined.ToString();
-    }
-
-    public string SaveToBundle(string content)
-    {
-        var date = DateTime.Now.ToString("yyyy-MM-dd");
-        var bundleDir = Path.Combine("bundles", date);
-
-        if (!Directory.Exists(bundleDir))
-            Directory.CreateDirectory(bundleDir);
-
-        // Find next available ID
-        var existingFiles = Directory.GetFiles(bundleDir, "*.txt");
-        var nextId = 1;
-
-        if (existingFiles.Length > 0)
-        {
-            var maxId = existingFiles
-                .Select(f => Path.GetFileNameWithoutExtension(f))
-                .Where(name => int.TryParse(name, out _))
-                .Select(int.Parse)
-                .DefaultIfEmpty(0)
-                .Max();
-            nextId = maxId + 1;
-        }
-
-        var fileName = Path.Combine(bundleDir, $"{nextId}.txt");
-        File.WriteAllText(fileName, content);
-
-        return fileName;
-    }
-
-    public Dictionary<string, FileStatistics> GetFileStatistics(List<string> files)
-    {
-        var stats = new Dictionary<string, FileStatistics>();
-
-        foreach (var file in files)
-        {
-            var extension = Path.GetExtension(file).ToLower();
-            if (string.IsNullOrEmpty(extension))
-                extension = "(no extension)";
-
-            if (!stats.ContainsKey(extension))
-            {
-                stats[extension] = new FileStatistics { Extension = extension };
-            }
-
-            var lineCount = File.ReadLines(file).Count();
-            stats[extension].FileCount++;
-            stats[extension].TotalLines += lineCount;
-            stats[extension].Files.Add(Path.GetFileName(file));
-        }
-
-        return stats;
-    }
-
-    public void OpenFolder(string filePath)
-    {
-        var directory = Path.GetDirectoryName(filePath);
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = directory,
-            UseShellExecute = true,
-            Verb = "open"
-        });
+        
+        return true;
     }
 }

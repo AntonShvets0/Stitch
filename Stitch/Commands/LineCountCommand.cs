@@ -1,65 +1,73 @@
-﻿using Stitch.Models;
+﻿using Microsoft.Extensions.Options;
+using Stitch.Console;
+using Stitch.Models;
 using Stitch.Services;
 using Stitch.Services.Files;
 
 namespace Stitch.Commands;
 
-public class LineCountCommand(ConsoleService consoleService, FileService fileService) : ICommand
+public class LineCountCommand : ICommand
 {
-    public void Execute(CommandOptions options)
-    {
-        consoleService.ShowProgress($"Analyzing files matching '{options.Pattern}'...");
-        
-        var files = fileService.GetFilesByPattern(options.Pattern, options.IgnoreGitignore);
-        consoleService.ClearProgress();
+    private readonly IConsoleRenderer _renderer;
+    private readonly FileService _fileService;
+    private readonly StitchConfiguration _stitchConfiguration;
 
-        if (!files.Any())
+    public LineCountCommand(IConsoleRenderer renderer, FileService fileService, IOptions<StitchConfiguration> stOptions)
+    {
+        _stitchConfiguration = stOptions.Value;
+        _renderer = renderer;
+        _fileService = fileService;
+    }
+
+    public async Task ExecuteAsync(CommandOptions options)
+    {
+        _renderer.RenderInfo($"Analyzing files matching '{string.Join(", ", options.Pattern)}'...");
+        
+        var result = await _fileService.GetFilesByPatternAsync(options.Pattern, options.IgnoreGitignore, _stitchConfiguration.DefaultExtensions);
+        if (!result.IsSuccess)
         {
-            consoleService.ShowError($"No files found matching pattern '{options.Pattern}'");
+            _renderer.RenderError(result.Error);
             return;
         }
 
-        var statistics = fileService.GetFileStatistics(files);
-
-        Console.WriteLine();
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("File Statistics");
-        Console.WriteLine("═══════════════════════════════════════════════════════");
-        Console.ResetColor();
-
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"{"Extension",-15} {"Files",-10} {"Lines",-10} {"Avg Lines",-10}");
-        Console.WriteLine($"{new string('─', 15)} {new string('─', 10)} {new string('─', 10)} {new string('─', 10)}");
-        Console.ResetColor();
-
-        foreach (var stat in statistics.OrderByDescending(s => s.Value.TotalLines))
+        var files = result.Value;
+        if (!files.Any())
         {
-            var avgLines = stat.Value.TotalLines / (double)stat.Value.FileCount;
-            
-            Console.ForegroundColor = ConsoleColor.White;
-            Console.WriteLine($"{stat.Key,-15} {stat.Value.FileCount,-10} {stat.Value.TotalLines,-10} {avgLines,-10:F1}");
+            _renderer.RenderError($"No files found matching pattern '{string.Join(", ", options.Pattern)}'");
+            return;
         }
 
-        Console.WriteLine();
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"Total: {files.Count} files, {statistics.Sum(s => s.Value.TotalLines)} lines");
-        Console.ResetColor();
+        var statistics = await CalculateStatisticsAsync(files);
+        _renderer.RenderFileStatistics(statistics, files);
+    }
 
-        // Show top 5 largest files
-        Console.WriteLine();
-        Console.ForegroundColor = ConsoleColor.Magenta;
-        Console.WriteLine("Top 5 Largest Files:");
-        Console.WriteLine("═══════════════════════════════════════════════════════");
-        Console.ResetColor();
+    private async Task<Dictionary<string, FileStatistics>> CalculateStatisticsAsync(IEnumerable<string> files)
+    {
+        var statistics = new Dictionary<string, FileStatistics>();
 
-        var topFiles = files
-            .Select(f => new { File = f, Lines = System.IO.File.ReadLines(f).Count() })
-            .OrderByDescending(f => f.Lines)
-            .Take(5);
-
-        foreach (var file in topFiles)
+        await Task.Run(() =>
         {
-            Console.WriteLine($"  {System.IO.Path.GetFileName(file.File),-40} {file.Lines,6} lines");
-        }
+            foreach (var file in files.Where(File.Exists))
+            {
+                var extension = Path.GetExtension(file).TrimStart('.').ToLowerInvariant();
+                if (string.IsNullOrEmpty(extension)) extension = "no extension";
+
+                if (!statistics.ContainsKey(extension))
+                {
+                    statistics[extension] = new FileStatistics
+                    {
+                        Extension = extension,
+                        Files = new List<string>()
+                    };
+                }
+
+                var lineCount = File.ReadLines(file).Count();
+                statistics[extension].FileCount++;
+                statistics[extension].TotalLines += lineCount;
+                statistics[extension].Files.Add(file);
+            }
+        });
+
+        return statistics;
     }
 }
