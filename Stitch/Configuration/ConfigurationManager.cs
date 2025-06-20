@@ -12,14 +12,14 @@ public static class ConfigurationManager
         EnsureConfigFileExists();
         
         return new ConfigurationBuilder()
-            .SetBasePath(Directory.GetCurrentDirectory())
+            .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
             .AddJsonFile(ConfigFileName, optional: false, reloadOnChange: true)
             .Build();
     }
     
     private static void EnsureConfigFileExists()
     {
-        var configPath = Path.Combine(Directory.GetCurrentDirectory(), ConfigFileName);
+        var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ConfigFileName);
         
         if (!File.Exists(configPath))
         {
